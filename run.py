@@ -1,14 +1,14 @@
 import argparse
 import json
-from transformers import AutoTokenizer, AutoModel
+# from transformers import AutoTokenizer, AutoModel
 from sentence_transformers import SentenceTransformer
-from src.config import LinearRAGConfig
-from src.LinearRAG import LinearRAG
+# from src.config import ClassRAGConfig
+# from src.ClassRAG import LinearRAG
 import os
 import warnings
-from src.evaluate import Evaluator
-from src.utils import LLM_Model
-from src.utils import setup_logging
+# from src.evaluate import Evaluator
+# from src.utils import LLM_Model
+# from src.utils import setup_logging
 from datetime import datetime
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -18,7 +18,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--spacy_model", type=str, default="en_core_web_trf", help="The spacy model to use")
     parser.add_argument("--embedding_model", type=str, default="model/all-mpnet-base-v2", help="The path of embedding model to use")
-    parser.add_argument("--dataset_name", type=str, default="novel", help="The dataset to use")
+    parser.add_argument("--dataset_name", type=str, default="2wiki_small", help="The dataset to use")
     parser.add_argument("--llm_model", type=str, default="/home/wenbin.guo/.cache/modelscope/hub/models/Qwen/Qwen3-8B", help="The LLM model to use")
     parser.add_argument("--max_workers", type=int, default=16, help="The max number of workers to use")
     parser.add_argument("--max_iterations", type=int, default=3, help="The max number of iterations to use")
@@ -36,7 +36,11 @@ def load_dataset(dataset_name):
     chunks_path = f"dataset/{dataset_name}/chunks.json"
     with open(chunks_path, "r", encoding="utf-8") as f:
         chunks = json.load(f)
-    passages = [f'{idx}:{chunk}' for idx, chunk in enumerate(chunks)]
+    # passages = [f'{idx}:{chunk}' for idx, chunk in enumerate(chunks)]
+    if all(isinstance(chunk, str) and re.match(r"^\d+:", chunk) for chunk in chunks):
+        passages = chunks
+    else:
+        passages = [f"{idx}:{chunk}" for idx, chunk in enumerate(chunks)]
     return questions, passages
 
 def load_embedding_model(embedding_model):
@@ -49,6 +53,7 @@ def main():
     args = parse_arguments()
     embedding_model = load_embedding_model(args.embedding_model)
     questions,passages = load_dataset(args.dataset_name)
+    os.makedirs(f"results/{args.dataset_name}/{time_str}", exist_ok=True)
     setup_logging(f"results/{args.dataset_name}/{time_str}/log.txt")
     llm_model = LLM_Model(args.llm_model)
     config = LinearRAGConfig(
@@ -66,10 +71,11 @@ def main():
     rag_model = LinearRAG(global_config=config)
     rag_model.index(passages)
     questions = rag_model.qa(questions)
-    os.makedirs(f"results/{args.dataset_name}/{time_str}", exist_ok=True)
     with open(f"results/{args.dataset_name}/{time_str}/predictions.json", "w", encoding="utf-8") as f:
         json.dump(questions, f, ensure_ascii=False, indent=4)
     evaluator = Evaluator(llm_model=llm_model, predictions_path=f"results/{args.dataset_name}/{time_str}/predictions.json")
     evaluator.evaluate(max_workers=args.max_workers)
+
+    # print(passages[0][:10])
 if __name__ == "__main__":
     main()
