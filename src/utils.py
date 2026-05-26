@@ -31,6 +31,33 @@ class LLM_Model:
     #     response = self.openai_client.chat.completions.create(**self.llm_config,messages=messages)
     #     print(response)
     #     return response.choices[0].message.content
+
+    def infer_raw(self, messages):
+        """
+        Return the raw model output with only minimal tag cleanup.
+        This function preserves JSON punctuation such as [], "", and commas.
+        Use this for entity class inference.
+        """
+        response = self.openai_client.chat.completions.create(
+            **self.llm_config,
+            messages=messages
+        )
+
+        content = response.choices[0].message.content
+
+        if content is None:
+            return ""
+
+        # Extract text after Answer:
+        if "Answer:" in content:
+            content = content.split("Answer:")[-1].strip()
+
+        # Remove thinking/tool tags, but keep JSON punctuation
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+        content = re.sub(r"<tool_call>.*?</tool_call>", "", content, flags=re.DOTALL)
+
+        return content.strip()
+
     def infer(self, messages):
         response = self.openai_client.chat.completions.create(**self.llm_config, messages=messages)
         # print("Raw LLM response:", response)
@@ -45,6 +72,9 @@ class LLM_Model:
 
         content = content.strip()
         content = normalize_answer(content)
+
+        print(content)
+
         return content
 
 

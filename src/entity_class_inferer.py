@@ -490,7 +490,7 @@ Output only the correct format.
 
         try:
             messages = self.build_prompt(entity_text)
-            raw_output = self.llm_model.infer(messages)
+            raw_output = self.llm_model.infer_raw(messages)
             classes = self.parse_class_list(raw_output)
 
             # Retry once if parsing failed
@@ -498,7 +498,7 @@ Output only the correct format.
                 logger.warning(f"Empty or invalid classes for [{entity_text}], retrying once.")
 
                 retry_messages = self.build_retry_prompt(entity_text)
-                raw_output_retry = self.llm_model.infer(retry_messages)
+                raw_output_retry = self.llm_model.infer_raw(retry_messages)
                 classes_retry = self.parse_class_list(raw_output_retry)
 
                 if len(classes_retry) > 0:
