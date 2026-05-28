@@ -5,11 +5,12 @@ import json
 import argparse
 import logging
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------
-# Make sure this file can be run directly from project root:
+# Run from project root:
 # python src/schema_state_builder.py
 # ---------------------------------------------------------------------
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -35,9 +36,12 @@ VALID_RELATIONS = {
 }
 
 
-def invert_relation(relation):
+def invert_relation(relation: str) -> str:
     """
     Invert relation direction when cached pair is queried in reverse order.
+
+    If stored relation is A_PARENT_B for (A, B),
+    then queried as (B, A), it becomes B_PARENT_A.
     """
     if relation == "A_PARENT_B":
         return "B_PARENT_A"
@@ -236,9 +240,6 @@ Output format:
         return self.llm_model.infer(messages)
 
     def parse_relation_output(self, raw_output):
-        """
-        Parse LLM output into relation / confidence / reason.
-        """
         if raw_output is None:
             return {
                 "relation": "UNCERTAIN",
@@ -257,7 +258,7 @@ Output format:
         text = re.sub(r"^```\s*", "", text).strip()
         text = re.sub(r"\s*```$", "", text).strip()
 
-        # Try direct JSON parsing
+        # Direct JSON parsing
         try:
             parsed = json.loads(text)
             relation = str(parsed.get("relation", "UNCERTAIN")).strip().upper()
@@ -277,7 +278,7 @@ Output format:
         except Exception:
             pass
 
-        # Try extracting first JSON object
+        # Extract first JSON object
         object_match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
         if object_match:
             try:
@@ -318,9 +319,6 @@ Output format:
         }
 
     def judge(self, class_a, class_b):
-        """
-        Judge relation between two class names.
-        """
         messages = self.build_prompt(class_a, class_b)
 
         raw_output = self._call_llm_raw(messages)
@@ -343,19 +341,25 @@ class SchemaState:
     """
     Incremental schema state.
 
-    It maintains:
-    1. Equivalent relation by DSU
-    2. Parent-child relation by DAG
-    3. Related relation by undirected graph
-    4. Comparison cache
-    5. Insertion records
+    Main principle:
+    - Insert classes one by one.
+    - Insertions are sequential.
+    - For one new class, comparisons against nodes in the same layer are parallel.
+    - SchemaState updates are always sequential and deterministic.
+
+    Data structures:
+    1. Equivalent relation: DSU
+    2. Parent-child relation: DAG
+    3. Related relation: undirected graph
+    4. Unrelated / uncertain relation: cache only
     """
 
     def __init__(
         self,
         class_freq,
         confidence_threshold=0.0,
-        unrelated_skip_confidence=0.0,
+        schema_max_workers=4,
+        allow_multi_parent=False,
     ):
         self.class_freq = dict(class_freq)
 
@@ -376,7 +380,8 @@ class SchemaState:
         self.conflict_records = []
 
         self.confidence_threshold = confidence_threshold
-        self.unrelated_skip_confidence = unrelated_skip_confidence
+        self.schema_max_workers = max(1, int(schema_max_workers))
+        self.allow_multi_parent = allow_multi_parent
 
         self.num_llm_calls = 0
         self.num_cache_hits = 0
@@ -396,11 +401,7 @@ class SchemaState:
         return tuple(sorted([a, b]))
 
     def _relation_for_orientation(self, record, query_a, query_b):
-        """
-        Return relation in the direction of query_a/query_b.
-        """
         relation = record["relation"]
-
         stored_a = record["class_a"]
         stored_b = record["class_b"]
 
@@ -412,62 +413,10 @@ class SchemaState:
 
         return relation
 
-    def get_roots(self):
-        """
-        Current canonical roots among inserted classes.
-        """
-        self.canonicalize_graphs()
-
-        inserted_reps = {self.find(x) for x in self.inserted_classes}
-
-        roots = []
-        for cls in sorted(inserted_reps, key=lambda x: (-self.class_freq.get(x, 0), x.lower())):
-            if len(self.child_to_parents.get(cls, set())) == 0:
-                roots.append(cls)
-
-        return roots
-
-    def is_ancestor(self, ancestor, descendant):
-        """
-        Whether ancestor -> ... -> descendant exists.
-        """
-        ancestor = self.find(ancestor)
-        descendant = self.find(descendant)
-
-        if ancestor == descendant:
-            return True
-
-        visited = set()
-        stack = list(self.parent_to_children.get(ancestor, set()))
-
-        while stack:
-            node = stack.pop()
-            if node == descendant:
-                return True
-            if node in visited:
-                continue
-
-            visited.add(node)
-            stack.extend(self.parent_to_children.get(node, set()))
-
-        return False
-
-    def would_create_cycle(self, parent, child):
-        """
-        Adding parent -> child creates a cycle if child is already ancestor of parent.
-        """
-        parent = self.find(parent)
-        child = self.find(child)
-
-        if parent == child:
-            return True
-
-        return self.is_ancestor(child, parent)
-
     def canonicalize_graphs(self):
         """
         Map all graph nodes to DSU representatives.
-        Remove self-loops, duplicate edges, and related edges that are already parent-child.
+        Remove self-loops, duplicate edges, and related edges that already have parent-child path.
         """
         # Canonicalize DAG
         new_parent_to_children = defaultdict(set)
@@ -488,7 +437,7 @@ class SchemaState:
         self.parent_to_children = new_parent_to_children
         self.child_to_parents = new_child_to_parents
 
-        # Canonicalize related edges
+        # Canonicalize related graph
         new_related_edges = set()
 
         for a, b in self.related_edges:
@@ -504,9 +453,53 @@ class SchemaState:
             new_related_edges.add(tuple(sorted([ra, rb])))
 
         self.related_edges = new_related_edges
-
-        # Canonicalize inserted classes
         self.inserted_classes = {self.find(x) for x in self.inserted_classes}
+
+    def get_roots(self):
+        self.canonicalize_graphs()
+
+        inserted_reps = {self.find(x) for x in self.inserted_classes}
+
+        roots = []
+        for cls in inserted_reps:
+            if len(self.child_to_parents.get(cls, set())) == 0:
+                roots.append(cls)
+
+        roots.sort(key=lambda x: (-self.class_freq.get(x, 0), x.lower()))
+        return roots
+
+    def is_ancestor(self, ancestor, descendant):
+        ancestor = self.find(ancestor)
+        descendant = self.find(descendant)
+
+        if ancestor == descendant:
+            return True
+
+        visited = set()
+        stack = list(self.parent_to_children.get(ancestor, set()))
+
+        while stack:
+            node = stack.pop()
+
+            if node == descendant:
+                return True
+
+            if node in visited:
+                continue
+
+            visited.add(node)
+            stack.extend(self.parent_to_children.get(node, set()))
+
+        return False
+
+    def would_create_cycle(self, parent, child):
+        parent = self.find(parent)
+        child = self.find(child)
+
+        if parent == child:
+            return True
+
+        return self.is_ancestor(child, parent)
 
     def remove_subclass_edge(self, parent, child):
         parent = self.find(parent)
@@ -520,17 +513,13 @@ class SchemaState:
         b = self.find(b)
 
         if a == b:
-            return self.find(a)
+            return a
 
         rep = self.dsu.union(a, b)
         self.canonicalize_graphs()
-
         return rep
 
     def add_subclass_edge(self, parent, child, record=None):
-        """
-        Add parent -> child into DAG if it does not create cycle.
-        """
         parent = self.find(parent)
         child = self.find(child)
 
@@ -557,7 +546,6 @@ class SchemaState:
             self.related_edges.remove(edge_key)
 
         self.remove_transitive_redundant_edges()
-
         return True
 
     def add_related_edge(self, a, b, record=None):
@@ -589,7 +577,7 @@ class SchemaState:
 
     def remove_transitive_redundant_edges(self):
         """
-        Remove direct edge A -> C if another path A -> ... -> C exists.
+        Remove direct edge A -> C if there is another path A -> ... -> C.
         """
         edges = []
 
@@ -611,16 +599,37 @@ class SchemaState:
                 self.parent_to_children[parent].add(child)
                 self.child_to_parents[child].add(parent)
 
-    def compare(self, class_a, class_b, judge):
+    def _make_record(self, class_a, class_b, result):
+        relation = str(result.get("relation", "UNCERTAIN")).strip().upper()
+        confidence = float(result.get("confidence", 0.0))
+
+        if confidence < self.confidence_threshold:
+            relation = "UNCERTAIN"
+
+        if relation not in VALID_RELATIONS:
+            relation = "UNCERTAIN"
+
+        return {
+            "class_a": class_a,
+            "class_b": class_b,
+            "relation": relation,
+            "confidence": confidence,
+            "reason": result.get("reason", ""),
+            "raw_output": result.get("raw_output", ""),
+        }
+
+    def compare_one(self, class_a, class_b, judge):
         """
-        Compare two canonical classes with pruning and cache.
-        Relation is returned in the orientation class_a -> class_b.
+        Compare two canonical classes. This method can call LLM.
+        It does not modify schema edges, but may write comparison cache.
         """
         class_a = self.find(class_a)
         class_b = self.find(class_b)
 
         if class_a == class_b:
             return {
+                "class_a": class_a,
+                "class_b": class_b,
                 "relation": "EQUIVALENT",
                 "confidence": 1.0,
                 "reason": "Same equivalence group.",
@@ -628,10 +637,11 @@ class SchemaState:
                 "from_cache": True,
             }
 
-        # Existing parent-child path can be used directly
         if self.is_ancestor(class_a, class_b):
             self.num_pruned_pairs += 1
             return {
+                "class_a": class_a,
+                "class_b": class_b,
                 "relation": "A_PARENT_B",
                 "confidence": 1.0,
                 "reason": "Existing ancestor path.",
@@ -642,6 +652,8 @@ class SchemaState:
         if self.is_ancestor(class_b, class_a):
             self.num_pruned_pairs += 1
             return {
+                "class_a": class_a,
+                "class_b": class_b,
                 "relation": "B_PARENT_A",
                 "confidence": 1.0,
                 "reason": "Existing ancestor path.",
@@ -657,6 +669,8 @@ class SchemaState:
             relation = self._relation_for_orientation(cached, class_a, class_b)
 
             return {
+                "class_a": class_a,
+                "class_b": class_b,
                 "relation": relation,
                 "confidence": cached.get("confidence", 0.0),
                 "reason": cached.get("reason", ""),
@@ -665,71 +679,217 @@ class SchemaState:
             }
 
         result = judge.judge(class_a, class_b)
-        self.num_llm_calls += 1
-
-        relation = result.get("relation", "UNCERTAIN")
-        confidence = float(result.get("confidence", 0.0))
-
-        if confidence < self.confidence_threshold:
-            relation = "UNCERTAIN"
-
-        if relation not in VALID_RELATIONS:
-            relation = "UNCERTAIN"
-
-        record = {
-            "class_a": class_a,
-            "class_b": class_b,
-            "relation": relation,
-            "confidence": confidence,
-            "reason": result.get("reason", ""),
-            "raw_output": result.get("raw_output", ""),
-        }
+        record = self._make_record(class_a, class_b, result)
 
         self.comparison_cache[pair_key] = record
         self.llm_relation_records.append(record)
+        self.num_llm_calls += 1
 
         return {
             **record,
             "from_cache": False,
         }
 
-    def apply_relation(self, class_a, class_b, result):
+    def compare_layer_parallel(self, new_class, candidates, judge):
         """
-        Apply a relation result to the corresponding structure.
+        Compare new_class with all candidates in the same layer.
+
+        LLM calls are parallel.
+        Schema updates are NOT performed here.
         """
-        class_a = self.find(class_a)
-        class_b = self.find(class_b)
+        new_class = self.find(new_class)
 
-        relation = result.get("relation", "UNCERTAIN")
-        confidence = float(result.get("confidence", 0.0))
+        clean_candidates = []
+        seen = set()
 
-        if relation == "EQUIVALENT":
-            self.add_equivalent(class_a, class_b, result)
+        for cand in candidates:
+            cand = self.find(cand)
+            if cand == new_class:
+                continue
+            if cand in seen:
+                continue
+            seen.add(cand)
+            clean_candidates.append(cand)
 
-        elif relation == "A_PARENT_B":
-            self.add_subclass_edge(parent=class_a, child=class_b, record=result)
+        if not clean_candidates:
+            return []
 
-        elif relation == "B_PARENT_A":
-            self.add_subclass_edge(parent=class_b, child=class_a, record=result)
+        results = []
 
-        elif relation == "RELATED":
-            self.add_related_edge(class_a, class_b, record=result)
+        cached_or_pruned = []
+        to_call = []
 
-        elif relation == "UNRELATED":
-            self.add_unrelated_pair(class_a, class_b)
+        for cand in clean_candidates:
+            pair_key = self._pair_key(new_class, cand)
 
-        else:
-            self.add_uncertain_pair(class_a, class_b)
+            if new_class == cand:
+                cached_or_pruned.append({
+                    "class_a": new_class,
+                    "class_b": cand,
+                    "relation": "EQUIVALENT",
+                    "confidence": 1.0,
+                    "reason": "Same equivalence group.",
+                    "raw_output": "",
+                    "from_cache": True,
+                })
+                continue
+
+            if self.is_ancestor(new_class, cand):
+                self.num_pruned_pairs += 1
+                cached_or_pruned.append({
+                    "class_a": new_class,
+                    "class_b": cand,
+                    "relation": "A_PARENT_B",
+                    "confidence": 1.0,
+                    "reason": "Existing ancestor path.",
+                    "raw_output": "",
+                    "from_cache": True,
+                })
+                continue
+
+            if self.is_ancestor(cand, new_class):
+                self.num_pruned_pairs += 1
+                cached_or_pruned.append({
+                    "class_a": new_class,
+                    "class_b": cand,
+                    "relation": "B_PARENT_A",
+                    "confidence": 1.0,
+                    "reason": "Existing ancestor path.",
+                    "raw_output": "",
+                    "from_cache": True,
+                })
+                continue
+
+            if pair_key in self.comparison_cache:
+                self.num_cache_hits += 1
+                cached = self.comparison_cache[pair_key]
+                relation = self._relation_for_orientation(cached, new_class, cand)
+
+                cached_or_pruned.append({
+                    "class_a": new_class,
+                    "class_b": cand,
+                    "relation": relation,
+                    "confidence": cached.get("confidence", 0.0),
+                    "reason": cached.get("reason", ""),
+                    "raw_output": cached.get("raw_output", ""),
+                    "from_cache": True,
+                })
+                continue
+
+            to_call.append(cand)
+
+        results.extend(cached_or_pruned)
+
+        if to_call:
+            max_workers = min(self.schema_max_workers, len(to_call))
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_candidate = {
+                    executor.submit(judge.judge, new_class, cand): cand
+                    for cand in to_call
+                }
+
+                for future in as_completed(future_to_candidate):
+                    cand = future_to_candidate[future]
+
+                    try:
+                        raw_result = future.result()
+                    except Exception as e:
+                        logger.error(f"LLM relation judging failed: {new_class} vs {cand}: {e}")
+                        raw_result = {
+                            "relation": "UNCERTAIN",
+                            "confidence": 0.0,
+                            "reason": str(e),
+                            "raw_output": "",
+                        }
+
+                    record = self._make_record(new_class, cand, raw_result)
+
+                    pair_key = self._pair_key(new_class, cand)
+                    self.comparison_cache[pair_key] = record
+                    self.llm_relation_records.append(record)
+                    self.num_llm_calls += 1
+
+                    results.append({
+                        **record,
+                        "from_cache": False,
+                    })
+
+        results.sort(
+            key=lambda r: (
+                -float(r.get("confidence", 0.0)),
+                r.get("class_b", "").lower()
+            )
+        )
+
+        return results
+
+    def _split_results(self, results):
+        equivalent = []
+        new_parent_of_candidate = []
+        candidate_parent_of_new = []
+        related = []
+        unrelated = []
+        uncertain = []
+
+        for r in results:
+            relation = r.get("relation", "UNCERTAIN")
+
+            if relation == "EQUIVALENT":
+                equivalent.append(r)
+            elif relation == "A_PARENT_B":
+                new_parent_of_candidate.append(r)
+            elif relation == "B_PARENT_A":
+                candidate_parent_of_new.append(r)
+            elif relation == "RELATED":
+                related.append(r)
+            elif relation == "UNRELATED":
+                unrelated.append(r)
+            else:
+                uncertain.append(r)
+
+        equivalent.sort(key=lambda x: -float(x.get("confidence", 0.0)))
+        new_parent_of_candidate.sort(key=lambda x: -float(x.get("confidence", 0.0)))
+        candidate_parent_of_new.sort(key=lambda x: -float(x.get("confidence", 0.0)))
+        related.sort(key=lambda x: -float(x.get("confidence", 0.0)))
+        unrelated.sort(key=lambda x: -float(x.get("confidence", 0.0)))
+        uncertain.sort(key=lambda x: -float(x.get("confidence", 0.0)))
+
+        return {
+            "equivalent": equivalent,
+            "new_parent_of_candidate": new_parent_of_candidate,
+            "candidate_parent_of_new": candidate_parent_of_new,
+            "related": related,
+            "unrelated": unrelated,
+            "uncertain": uncertain,
+        }
+
+    def _choose_parent_candidates(self, candidates):
+        """
+        Choose parent candidates for descending.
+
+        If allow_multi_parent=False, choose only the highest-confidence parent.
+        If allow_multi_parent=True, keep all candidate parents.
+        """
+        if not candidates:
+            return []
+
+        if self.allow_multi_parent:
+            return candidates
+
+        return [candidates[0]]
 
     def insert_class(self, new_class, judge):
         """
         Insert one new class into existing schema forest.
 
-        It compares the new class with each existing root.
-        If root is parent of new class, search its direct children recursively.
-        If new class is parent of root, place new class above the root.
-        If related, only add related edge to the root and stop searching that tree.
-        If unrelated or uncertain, skip that tree.
+        Core logic:
+        1. Compare new class with all current roots in parallel.
+        2. If equivalent: union and stop.
+        3. If new class is parent of root(s): add new_class -> root(s).
+        4. If root is parent of new class: descend into that root's direct children.
+        5. If related: add related edge to current node only, do not expand to descendants.
+        6. If unrelated / uncertain: record and skip the tree.
         """
         original_new_class = new_class
         new_class = self.find(new_class)
@@ -750,90 +910,89 @@ class SchemaState:
             return
 
         roots = self.get_roots()
+        layer_results = self.compare_layer_parallel(new_class, roots, judge)
+        groups = self._split_results(layer_results)
+
+        # 1. Equivalent has the highest priority.
+        if groups["equivalent"]:
+            best = groups["equivalent"][0]
+            rep = self.add_equivalent(new_class, best["class_b"], best)
+            self.inserted_classes.add(rep)
+
+            record["actions"].append({
+                "action": "equivalent_to_root",
+                "new_class": original_new_class,
+                "root": best["class_b"],
+                "representative": rep,
+                "result": best,
+            })
+
+            self.canonicalize_graphs()
+            self.insertion_records.append(record)
+            return
+
         structurally_inserted = False
-        equivalent_merged = False
 
-        for root in list(roots):
-            new_class = self.find(new_class)
-            root = self.find(root)
+        # 2. Add related edges to roots, but do not expand to their descendants.
+        for r in groups["related"]:
+            self.add_related_edge(new_class, r["class_b"], r)
+            record["actions"].append({
+                "action": "related_to_root_skip_subtree",
+                "new_class": new_class,
+                "root": r["class_b"],
+                "result": r,
+            })
 
-            if new_class == root:
+        # 3. Record unrelated / uncertain root relations.
+        for r in groups["unrelated"]:
+            self.add_unrelated_pair(new_class, r["class_b"])
+            record["actions"].append({
+                "action": "unrelated_to_root_skip_subtree",
+                "new_class": new_class,
+                "root": r["class_b"],
+                "result": r,
+            })
+
+        for r in groups["uncertain"]:
+            self.add_uncertain_pair(new_class, r["class_b"])
+            record["actions"].append({
+                "action": "uncertain_with_root_skip_subtree",
+                "new_class": new_class,
+                "root": r["class_b"],
+                "result": r,
+            })
+
+        # 4. If new class is parent of existing roots, place it above them.
+        for r in groups["new_parent_of_candidate"]:
+            child_root = r["class_b"]
+            added = self.add_subclass_edge(parent=new_class, child=child_root, record=r)
+
+            if added:
                 structurally_inserted = True
-                equivalent_merged = True
-                break
+                record["actions"].append({
+                    "action": "new_class_parent_of_root",
+                    "new_class": new_class,
+                    "root": child_root,
+                    "result": r,
+                })
 
-            result = self.compare(new_class, root, judge)
-            relation = result["relation"]
-            confidence = float(result.get("confidence", 0.0))
+        # 5. If existing root is parent of new class, descend into best parent root(s).
+        parent_candidates = self._choose_parent_candidates(groups["candidate_parent_of_new"])
 
-            if relation == "EQUIVALENT":
-                rep = self.add_equivalent(new_class, root, result)
-                self.inserted_classes.add(rep)
+        for parent_result in parent_candidates:
+            parent_root = parent_result["class_b"]
+
+            inserted_under_root = self._insert_under_parent_parallel(
+                new_class=new_class,
+                parent=parent_root,
+                judge=judge,
+                record=record,
+            )
+
+            if inserted_under_root:
                 structurally_inserted = True
-                equivalent_merged = True
 
-                record["actions"].append({
-                    "action": "equivalent_to_root",
-                    "new_class": original_new_class,
-                    "root": root,
-                    "representative": rep,
-                    "result": result,
-                })
-                break
-
-            elif relation == "A_PARENT_B":
-                # new_class is parent of root
-                added = self.add_subclass_edge(parent=new_class, child=root, record=result)
-                if added:
-                    structurally_inserted = True
-                    record["actions"].append({
-                        "action": "new_class_parent_of_root",
-                        "new_class": new_class,
-                        "root": root,
-                        "result": result,
-                    })
-
-            elif relation == "B_PARENT_A":
-                # root is parent of new_class; search under root
-                inserted_under_root = self._insert_under_parent(
-                    new_class=new_class,
-                    parent=root,
-                    judge=judge,
-                    record=record,
-                )
-                if inserted_under_root:
-                    structurally_inserted = True
-
-            elif relation == "RELATED":
-                self.add_related_edge(new_class, root, record=result)
-                record["actions"].append({
-                    "action": "related_to_root_skip_subtree",
-                    "new_class": new_class,
-                    "root": root,
-                    "result": result,
-                })
-
-            elif relation == "UNRELATED":
-                self.add_unrelated_pair(new_class, root)
-                record["actions"].append({
-                    "action": "unrelated_to_root_skip_subtree",
-                    "new_class": new_class,
-                    "root": root,
-                    "result": result,
-                })
-
-            else:
-                self.add_uncertain_pair(new_class, root)
-                record["actions"].append({
-                    "action": "uncertain_with_root_skip_subtree",
-                    "new_class": new_class,
-                    "root": root,
-                    "result": result,
-                })
-
-        if not structurally_inserted and not equivalent_merged:
-            # No parent/equivalent/root-parent relation found.
-            # The class becomes an independent root.
+        if not structurally_inserted:
             new_class = self.find(new_class)
             record["actions"].append({
                 "action": "insert_as_independent_root",
@@ -844,22 +1003,11 @@ class SchemaState:
         self.canonicalize_graphs()
         self.insertion_records.append(record)
 
-    def _insert_under_parent(self, new_class, parent, judge, record):
+    def _insert_under_parent_parallel(self, new_class, parent, judge, record):
         """
-        Insert new_class somewhere under parent.
+        Insert new_class under a known parent.
 
-        Assumption:
-            parent is already judged as a parent of new_class.
-
-        Strategy:
-            Compare new_class with direct children of parent.
-            - If equivalent to a child: union and stop.
-            - If child is parent of new_class: recurse into child.
-            - If new_class is parent of a child: reparent that child under new_class.
-            - If related to a child: add related edge and skip that subtree.
-            - If unrelated/uncertain: skip that child subtree.
-
-            If no better child position is found, add parent -> new_class.
+        It compares new_class with all direct children of parent in parallel.
         """
         new_class = self.find(new_class)
         parent = self.find(parent)
@@ -879,147 +1027,130 @@ class SchemaState:
                 })
             return added
 
-        placed_deeper = False
-        equivalent_merged = False
-        children_to_reparent = []
+        layer_results = self.compare_layer_parallel(new_class, children, judge)
+        groups = self._split_results(layer_results)
 
-        for child in children:
-            new_class = self.find(new_class)
-            child = self.find(child)
+        # 1. Equivalent to a child: union and stop.
+        if groups["equivalent"]:
+            best = groups["equivalent"][0]
+            rep = self.add_equivalent(new_class, best["class_b"], best)
+            self.inserted_classes.add(rep)
 
-            if new_class == child:
-                placed_deeper = True
-                equivalent_merged = True
-                break
+            record["actions"].append({
+                "action": "equivalent_to_child",
+                "new_class": new_class,
+                "child": best["class_b"],
+                "representative": rep,
+                "result": best,
+            })
 
-            result = self.compare(new_class, child, judge)
-            relation = result["relation"]
+            return True
 
-            if relation == "EQUIVALENT":
-                rep = self.add_equivalent(new_class, child, result)
-                self.inserted_classes.add(rep)
-                placed_deeper = True
-                equivalent_merged = True
+        # 2. Related to direct children: add related edge only, do not expand.
+        for r in groups["related"]:
+            self.add_related_edge(new_class, r["class_b"], r)
+            record["actions"].append({
+                "action": "related_to_child_skip_subtree",
+                "new_class": new_class,
+                "child": r["class_b"],
+                "result": r,
+            })
+
+        # 3. Record unrelated / uncertain.
+        for r in groups["unrelated"]:
+            self.add_unrelated_pair(new_class, r["class_b"])
+            record["actions"].append({
+                "action": "unrelated_to_child_skip_subtree",
+                "new_class": new_class,
+                "child": r["class_b"],
+                "result": r,
+            })
+
+        for r in groups["uncertain"]:
+            self.add_uncertain_pair(new_class, r["class_b"])
+            record["actions"].append({
+                "action": "uncertain_with_child_skip_subtree",
+                "new_class": new_class,
+                "child": r["class_b"],
+                "result": r,
+            })
+
+        structurally_inserted = False
+
+        # 4. New class is parent of some existing direct children:
+        #    insert new_class between parent and those children.
+        children_to_reparent = [r["class_b"] for r in groups["new_parent_of_candidate"]]
+
+        if children_to_reparent:
+            added = self.add_subclass_edge(parent=parent, child=new_class)
+
+            if added:
+                structurally_inserted = True
+
+                for child in children_to_reparent:
+                    child = self.find(child)
+
+                    if child == new_class:
+                        continue
+
+                    self.remove_subclass_edge(parent, child)
+                    self.add_subclass_edge(parent=new_class, child=child)
 
                 record["actions"].append({
-                    "action": "equivalent_to_child",
+                    "action": "insert_as_intermediate_node",
+                    "parent": parent,
                     "new_class": new_class,
-                    "child": child,
-                    "representative": rep,
-                    "result": result,
-                })
-                break
-
-            elif relation == "A_PARENT_B":
-                # new_class is parent of child
-                children_to_reparent.append(child)
-                record["actions"].append({
-                    "action": "new_class_parent_of_existing_child",
-                    "new_class": new_class,
-                    "child": child,
-                    "result": result,
+                    "reparented_children": sorted([self.find(c) for c in children_to_reparent]),
                 })
 
-            elif relation == "B_PARENT_A":
-                # child is parent of new_class; go deeper
+        # 5. Existing child is parent of new class:
+        #    descend into best child parent(s).
+        parent_candidates = self._choose_parent_candidates(groups["candidate_parent_of_new"])
+
+        if parent_candidates:
+            for parent_result in parent_candidates:
+                child_parent = parent_result["class_b"]
+
                 record["actions"].append({
                     "action": "descend_into_child_subtree",
                     "new_class": new_class,
-                    "child_parent": child,
-                    "result": result,
+                    "child_parent": child_parent,
+                    "result": parent_result,
                 })
 
-                child_inserted = self._insert_under_parent(
+                inserted_deeper = self._insert_under_parent_parallel(
                     new_class=new_class,
-                    parent=child,
+                    parent=child_parent,
                     judge=judge,
                     record=record,
                 )
-                if child_inserted:
-                    placed_deeper = True
 
-            elif relation == "RELATED":
-                self.add_related_edge(new_class, child, record=result)
+                if inserted_deeper:
+                    structurally_inserted = True
+
+        # 6. If no better position found, insert directly under parent.
+        if not structurally_inserted:
+            added = self.add_subclass_edge(parent=parent, child=new_class)
+
+            if added:
                 record["actions"].append({
-                    "action": "related_to_child_skip_subtree",
-                    "new_class": new_class,
-                    "child": child,
-                    "result": result,
+                    "action": "insert_as_direct_child",
+                    "parent": parent,
+                    "child": new_class,
                 })
 
-            elif relation == "UNRELATED":
-                self.add_unrelated_pair(new_class, child)
-                record["actions"].append({
-                    "action": "unrelated_to_child_skip_subtree",
-                    "new_class": new_class,
-                    "child": child,
-                    "result": result,
-                })
+            return added
 
-            else:
-                self.add_uncertain_pair(new_class, child)
-                record["actions"].append({
-                    "action": "uncertain_with_child_skip_subtree",
-                    "new_class": new_class,
-                    "child": child,
-                    "result": result,
-                })
-
-        if equivalent_merged:
-            return True
-
-        new_class = self.find(new_class)
-        parent = self.find(parent)
-
-        # If new_class is parent of one or more existing children, insert it between parent and those children.
-        if children_to_reparent:
-            if not placed_deeper:
-                self.add_subclass_edge(parent=parent, child=new_class)
-
-            for child in children_to_reparent:
-                child = self.find(child)
-
-                if child == new_class:
-                    continue
-
-                # Reparent: parent -> child becomes parent -> new_class -> child
-                self.remove_subclass_edge(parent, child)
-                self.add_subclass_edge(parent=new_class, child=child)
-
-            record["actions"].append({
-                "action": "insert_as_intermediate_node",
-                "parent": parent,
-                "new_class": new_class,
-                "reparented_children": sorted([self.find(c) for c in children_to_reparent]),
-            })
-
-            return True
-
-        # If new_class was placed under a deeper child, no direct parent -> new_class edge is needed.
-        if placed_deeper:
-            return True
-
-        # Otherwise, parent is the best known parent, insert directly.
-        added = self.add_subclass_edge(parent=parent, child=new_class)
-        if added:
-            record["actions"].append({
-                "action": "insert_as_direct_child",
-                "parent": parent,
-                "child": new_class,
-            })
-
-        return added
+        return True
 
     def export(self):
-        """
-        Export schema state as serializable dict.
-        """
         self.canonicalize_graphs()
 
         canonical_map = self.dsu.canonical_map()
         groups = self.dsu.groups()
 
         canonical_classes = sorted({self.find(x) for x in self.inserted_classes})
+        roots = self.get_roots()
 
         subclass_edges = []
         for parent, children in self.parent_to_children.items():
@@ -1047,8 +1178,6 @@ class SchemaState:
             for a, b in sorted(self.uncertain_pairs)
         ]
 
-        roots = self.get_roots()
-
         return {
             "class_statistics": {
                 "num_raw_classes": len(self.class_freq),
@@ -1065,6 +1194,8 @@ class SchemaState:
                 "num_llm_calls": self.num_llm_calls,
                 "num_cache_hits": self.num_cache_hits,
                 "num_pruned_pairs": self.num_pruned_pairs,
+                "schema_max_workers": self.schema_max_workers,
+                "allow_multi_parent": self.allow_multi_parent,
             },
             "class_frequency": self.class_freq,
             "roots": roots,
@@ -1156,7 +1287,8 @@ def build_schema_incrementally(
     max_classes=0,
     max_insertions=0,
     confidence_threshold=0.0,
-    unrelated_skip_confidence=0.0,
+    schema_max_workers=4,
+    allow_multi_parent=False,
     checkpoint_every=10,
 ):
     logger.info(f"Loading entity classes from: {entity_classes_path}")
@@ -1180,7 +1312,8 @@ def build_schema_incrementally(
     state = SchemaState(
         class_freq=filtered_counter,
         confidence_threshold=confidence_threshold,
-        unrelated_skip_confidence=unrelated_skip_confidence,
+        schema_max_workers=schema_max_workers,
+        allow_multi_parent=allow_multi_parent,
     )
 
     judge = LLMClassRelationJudge(llm_model=llm_model)
@@ -1265,15 +1398,21 @@ def parse_arguments():
     parser.add_argument(
         "--confidence_threshold",
         type=float,
-        default=0.5,
+        default=0.0,
         help="Relations below this confidence are treated as UNCERTAIN."
     )
 
     parser.add_argument(
-        "--unrelated_skip_confidence",
-        type=float,
-        default=0.0,
-        help="Reserved for stricter unrelated subtree pruning."
+        "--schema_max_workers",
+        type=int,
+        default=16,
+        help="Max parallel LLM calls for one insertion layer."
+    )
+
+    parser.add_argument(
+        "--allow_multi_parent",
+        action="store_true",
+        help="Allow a class to descend into multiple parent candidates."
     )
 
     parser.add_argument(
@@ -1292,9 +1431,10 @@ def main():
     log_path = os.path.join(os.path.dirname(args.output_path), "schema_state_builder.log")
     setup_logging(log_path)
 
-    logger.info("Starting incremental SchemaState construction.")
+    logger.info("Starting parallel-layer incremental SchemaState construction.")
     logger.info(f"Entity class path: {args.entity_classes_path}")
     logger.info(f"Output path: {args.output_path}")
+    logger.info(f"Schema max workers: {args.schema_max_workers}")
 
     llm_model = LLM_Model(args.llm_model)
 
@@ -1306,7 +1446,8 @@ def main():
         max_classes=args.max_classes,
         max_insertions=args.max_insertions,
         confidence_threshold=args.confidence_threshold,
-        unrelated_skip_confidence=args.unrelated_skip_confidence,
+        schema_max_workers=args.schema_max_workers,
+        allow_multi_parent=args.allow_multi_parent,
         checkpoint_every=args.checkpoint_every,
     )
 
