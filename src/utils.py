@@ -73,7 +73,7 @@ class LLM_Model:
         content = content.strip()
         content = normalize_answer(content)
 
-        print(content)
+        # print(content)
 
         return content
 
