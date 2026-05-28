@@ -100,7 +100,7 @@ def parse_arguments():
 
     parser.add_argument(
         "--entity_class_overwrite",
-        action="store_true",
+        action="store_false",
         help="Overwrite existing import/{dataset_name}/entity_classes.json."
     )
 
@@ -116,6 +116,53 @@ def parse_arguments():
         type=int,
         default=4,
         help="Max workers for entity class inference."
+    )
+
+    parser.add_argument(
+        "--use_class_schema",
+        action="store_false",
+        help="Enable ontology class schema enhancement."
+    )
+
+    parser.add_argument(
+        "--entity_classes_path",
+        type=str,
+        default="import/2wikimultihop/entity_classes.json",
+        help="Path to entity_classes.json."
+    )
+
+    parser.add_argument(
+        "--schema_state_path",
+        type=str,
+        default="import/2wikimultihop/schema_state_incremental.json",
+        help="Path to schema_state json."
+    )
+
+    parser.add_argument(
+        "--query_type_cache_path",
+        type=str,
+        default="import/2wikimultihop/query_types.json",
+        help="Path to query type cache json."
+    )
+
+    parser.add_argument(
+        "--disable_llm_query_type_inference",
+        action="store_false",
+        help="Disable LLM fallback for query type inference."
+    )
+
+    parser.add_argument(
+        "--class_boost_alpha",
+        type=float,
+        default=0.3,
+        help="Class-aware boost coefficient for entity propagation."
+    )
+
+    parser.add_argument(
+        "--ppr_class_prior_gamma",
+        type=float,
+        default=0.3,
+        help="Class-aware prior coefficient for PPR reset."
     )
 
     return parser.parse_args()
@@ -205,6 +252,14 @@ def main():
         entity_class_overwrite=args.entity_class_overwrite,
         entity_class_max_classes=args.entity_class_max_classes,
         entity_class_max_workers=args.entity_class_max_workers,
+
+        use_class_schema=args.use_class_schema,
+        entity_classes_path=args.entity_classes_path,
+        schema_state_path=args.schema_state_path,
+        query_type_cache_path=args.query_type_cache_path,
+        enable_llm_query_type_inference=not args.disable_llm_query_type_inference,
+        class_boost_alpha=args.class_boost_alpha,
+        ppr_class_prior_gamma=args.ppr_class_prior_gamma,
     )
 
     rag_model = ClassRAG(global_config=config)

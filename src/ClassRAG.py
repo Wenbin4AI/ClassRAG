@@ -11,6 +11,7 @@ from tqdm import tqdm
 from src.ner import SpacyNER
 import igraph as ig
 import re
+from src.class_schema_manager import OntologySchemaManager, QueryTypeInferer
 import logging
 import torch
 logger = logging.getLogger(__name__)
@@ -33,6 +34,68 @@ class ClassRAG:
         self.llm_model = self.config.llm_model
         self.spacy_ner = SpacyNER(self.config.spacy_model)
         self.graph = ig.Graph(directed=False)
+
+        self.class_schema_enabled = getattr(self.config, "use_class_schema", False)
+        self.schema_manager = None
+        self.query_type_inferer = None
+        self._init_class_schema()
+
+    def _init_class_schema(self):
+        """
+        Initialize ontology schema manager and query type inferer.
+        This does not modify graph structure.
+        """
+        if not self.class_schema_enabled:
+            logger.info("Class schema enhancement is disabled.")
+            return
+
+        entity_classes_path = getattr(self.config, "entity_classes_path", "")
+        schema_state_path = getattr(self.config, "schema_state_path", "")
+        query_type_cache_path = getattr(self.config, "query_type_cache_path", "")
+
+        if not entity_classes_path:
+            entity_classes_path = os.path.join(
+                self.config.working_dir,
+                self.dataset_name,
+                "entity_classes.json"
+            )
+
+        if not schema_state_path:
+            schema_state_path = os.path.join(
+                self.config.working_dir,
+                self.dataset_name,
+                "schema_state_parallel_all.json"
+            )
+
+        if not query_type_cache_path:
+            query_type_cache_path = os.path.join(
+                self.config.working_dir,
+                self.dataset_name,
+                "query_type_cache.json"
+            )
+
+        logger.info("Initializing ontology schema manager.")
+        logger.info(f"Entity classes path: {entity_classes_path}")
+        logger.info(f"Schema state path: {schema_state_path}")
+        logger.info(f"Query type cache path: {query_type_cache_path}")
+
+        self.schema_manager = OntologySchemaManager(
+            entity_classes_path=entity_classes_path,
+            schema_state_path=schema_state_path,
+            same_weight=getattr(self.config, "schema_same_weight", 1.0),
+            descendant_weight=getattr(self.config, "schema_descendant_weight", 0.9),
+            ancestor_weight=getattr(self.config, "schema_ancestor_weight", 0.5),
+            related_weight=getattr(self.config, "schema_related_weight", 0.3),
+        )
+
+        self.query_type_inferer = QueryTypeInferer(
+            schema_manager=self.schema_manager,
+            llm_model=self.llm_model,
+            cache_path=query_type_cache_path,
+            enable_llm=getattr(self.config, "enable_llm_query_type_inference", True),
+        )
+
+        logger.info("Class schema enhancement is enabled.")
 
     def load_embedding_store(self):
         self.passage_embedding_store = EmbeddingStore(self.config.embedding_model, db_filename=os.path.join(self.config.working_dir,self.dataset_name, "passage_embedding.parquet"), batch_size=self.config.batch_size, namespace="passage")
@@ -109,9 +172,24 @@ class ClassRAG:
         for question_info in tqdm(questions, desc="Retrieving"):
             question = question_info["question"]
             question_embedding = self.config.embedding_model.encode(question,normalize_embeddings=True,show_progress_bar=False,batch_size=self.config.batch_size)
+
+            query_target_classes = []
+            if self.class_schema_enabled and self.query_type_inferer is not None:
+                query_target_classes = self.query_type_inferer.infer(question)
+                logger.info(f"Question: {question}")
+                logger.info(f"Query target classes: {query_target_classes}")
+
             seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores = self.get_seed_entities(question)
             if len(seed_entities) != 0:
-                sorted_passage_hash_ids,sorted_passage_scores = self.graph_search_with_seed_entities(question,question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
+                sorted_passage_hash_ids, sorted_passage_scores = self.graph_search_with_seed_entities(
+                    question,
+                    question_embedding,
+                    seed_entity_indices,
+                    seed_entities,
+                    seed_entity_hash_ids,
+                    seed_entity_scores,
+                    query_target_classes=query_target_classes,
+                )
                 final_passage_hash_ids = sorted_passage_hash_ids[:self.config.retrieval_top_k]
                 final_passage_scores = sorted_passage_scores[:self.config.retrieval_top_k]
                 final_passages = [self.passage_embedding_store.hash_id_to_text[passage_hash_id] for passage_hash_id in final_passage_hash_ids]
@@ -124,6 +202,7 @@ class ClassRAG:
                 "question": question,
                 "sorted_passage": final_passages,
                 "sorted_passage_scores": final_passage_scores,
+                "query_target_classes": query_target_classes,
                 "gold_answer": question_info["answer"]
             }
             retrieval_results.append(result)
@@ -184,15 +263,53 @@ class ClassRAG:
                 (num_sentences, num_entities), device=self.device
             )
             
-    def graph_search_with_seed_entities(self, question, question_embedding, seed_entity_indices, seed_entities, seed_entity_hash_ids, seed_entity_scores):
+    def graph_search_with_seed_entities(
+        self,
+        question,
+        question_embedding,
+        seed_entity_indices,
+        seed_entities,
+        seed_entity_hash_ids,
+        seed_entity_scores,
+        query_target_classes=None,
+    ):
+        query_target_classes = query_target_classes or []
+
         if self.config.use_vectorized_retrieval:
-            entity_weights, actived_entities = self.calculate_entity_scores_vectorized(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
+            logger.warning(
+                "Class-aware entity propagation currently only supports BFS version. "
+                "Vectorized retrieval will use original propagation, but PPR class prior can still be applied."
+            )
+            entity_weights, actived_entities = self.calculate_entity_scores_vectorized(
+                question_embedding,
+                seed_entity_indices,
+                seed_entities,
+                seed_entity_hash_ids,
+                seed_entity_scores
+            )
         else:
-            entity_weights, actived_entities = self.calculate_entity_scores(question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)
+            entity_weights, actived_entities = self.calculate_entity_scores(
+                question_embedding,
+                seed_entity_indices,
+                seed_entities,
+                seed_entity_hash_ids,
+                seed_entity_scores,
+                query_target_classes=query_target_classes,
+            )
+
+        # Add class-aware entity prior before PPR reset.
+        if self.class_schema_enabled and query_target_classes:
+            entity_weights = self.add_class_aware_entity_prior(
+                entity_weights=entity_weights,
+                actived_entities=actived_entities,
+                query_target_classes=query_target_classes,
+            )
+
         passage_weights = self.calculate_passage_scores(question, question_embedding, actived_entities)
         node_weights = entity_weights + passage_weights
-        ppr_sorted_passage_indices,ppr_sorted_passage_scores = self.run_ppr(node_weights)
-        return ppr_sorted_passage_indices,ppr_sorted_passage_scores
+        ppr_sorted_passage_indices, ppr_sorted_passage_scores = self.run_ppr(node_weights)
+
+        return ppr_sorted_passage_indices, ppr_sorted_passage_scores
 
     def run_ppr(self, node_weights):        
         reset_prob = np.where(np.isnan(node_weights) | (node_weights < 0), 0, node_weights)
@@ -216,7 +333,69 @@ class ClassRAG:
         
         return sorted_passage_hash_ids, sorted_passage_scores.tolist()
 
-    def calculate_entity_scores(self,question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores):
+    def get_entity_class_compatibility(self, entity_hash_id, query_target_classes):
+        """
+        Return compatibility between an entity's classes and query target classes.
+        """
+        if not self.class_schema_enabled:
+            return 0.0
+
+        if self.schema_manager is None:
+            return 0.0
+
+        if not query_target_classes:
+            return 0.0
+
+        return self.schema_manager.compatibility_for_entity(
+            entity_hash_id,
+            query_target_classes
+        )
+
+    def add_class_aware_entity_prior(self, entity_weights, actived_entities, query_target_classes):
+        """
+        Add class-aware prior to activated entities before PPR.
+
+        Only activated entities are boosted.
+        Do NOT boost all entities globally.
+        """
+        if not self.class_schema_enabled:
+            return entity_weights
+
+        if self.schema_manager is None:
+            return entity_weights
+
+        if not query_target_classes:
+            return entity_weights
+
+        gamma = getattr(self.config, "ppr_class_prior_gamma", 0.3)
+
+        for entity_hash_id, (entity_idx, entity_score, tier) in actived_entities.items():
+            compat = self.get_entity_class_compatibility(
+                entity_hash_id,
+                query_target_classes
+            )
+
+            if compat <= 0:
+                continue
+
+            node_idx = self.node_name_to_vertex_idx.get(entity_hash_id, None)
+            if node_idx is None:
+                continue
+
+            prior = gamma * float(entity_score) * float(compat)
+            entity_weights[node_idx] += prior
+
+        return entity_weights
+
+    def calculate_entity_scores(
+        self,
+        question_embedding,
+        seed_entity_indices,
+        seed_entities,
+        seed_entity_hash_ids,
+        seed_entity_scores,
+        query_target_classes=None,
+    ):
         actived_entities = {}
         entity_weights = np.zeros(len(self.graph.vs["name"]))
         for seed_entity_idx,seed_entity,seed_entity_hash_id,seed_entity_score in zip(seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores):
@@ -245,7 +424,19 @@ class ClassRAG:
                     used_sentence_hash_ids.add(top_sentence_hash_id)
                     entity_hash_ids_in_sentence = self.sentence_hash_id_to_entity_hash_ids[top_sentence_hash_id]
                     for next_entity_hash_id in entity_hash_ids_in_sentence:
-                        next_entity_score = entity_score * top_sentence_score
+                        base_next_entity_score = entity_score * top_sentence_score
+
+                        class_boost = 1.0
+                        if self.class_schema_enabled and query_target_classes:
+                            compat = self.get_entity_class_compatibility(
+                                next_entity_hash_id,
+                                query_target_classes
+                            )
+                            alpha = getattr(self.config, "class_boost_alpha", 0.3)
+                            class_boost = 1.0 + alpha * compat
+
+                        next_entity_score = base_next_entity_score * class_boost
+
                         if next_entity_score < self.config.iteration_threshold:
                             continue
                         next_enitity_node_idx = self.node_name_to_vertex_idx[next_entity_hash_id]
