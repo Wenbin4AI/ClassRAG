@@ -679,6 +679,7 @@ def main():
     print(f"Saved to: {args.output_path}")
 
 # python src/entity_class_inferer.py --overwrite
+# python run.py   --dataset_name hotpotqa   --entity_class_only   --entity_class_max_classes 4   --entity_class_max_workers 16
 
 if __name__ == "__main__":
     main()
