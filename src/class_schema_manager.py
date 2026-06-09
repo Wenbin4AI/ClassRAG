@@ -197,18 +197,18 @@ class OntologySchemaManager:
         if entity_class == target_class:
             return self.same_weight
 
-        # target is parent of entity_class
-        # Example: entity=City, target=Place
-        if self.is_ancestor(target_class, entity_class):
-            return self.descendant_weight
+        # # target is parent of entity_class
+        # # Example: entity=City, target=Place
+        # if self.is_ancestor(target_class, entity_class):
+        #     return self.descendant_weight
 
-        # entity_class is parent of target
-        # Example: entity=Place, target=City
-        if self.is_ancestor(entity_class, target_class):
-            return self.ancestor_weight
+        # # entity_class is parent of target
+        # # Example: entity=Place, target=City
+        # if self.is_ancestor(entity_class, target_class):
+        #     return self.ancestor_weight
 
-        if self.is_related(entity_class, target_class):
-            return self.related_weight
+        # if self.is_related(entity_class, target_class):
+        #     return self.related_weight
 
         return 0.0
 

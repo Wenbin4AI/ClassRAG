@@ -176,8 +176,8 @@ class ClassRAG:
             query_target_classes = []
             if self.class_schema_enabled and self.query_type_inferer is not None:
                 query_target_classes = self.query_type_inferer.infer(question)
-                logger.info(f"Question: {question}")
-                logger.info(f"Query target classes: {query_target_classes}")
+                logger.debug(f"Question: {question}")
+                logger.debug(f"Query target classes: {query_target_classes}")
 
             seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores = self.get_seed_entities(question)
             if len(seed_entities) != 0:
@@ -273,12 +273,24 @@ class ClassRAG:
         seed_entity_scores,
         query_target_classes=None,
     ):
+        """
+        Graph-based retrieval starting from seed entities.
+
+        Compared with the original LinearRAG process, this version adds:
+        1. Class-aware entity propagation in BFS mode.
+        2. Class-aware entity prior before PPR.
+        3. Query-aware edge transition probability during PPR.
+        """
         query_target_classes = query_target_classes or []
 
+        # ------------------------------------------------------------
+        # 1. Entity propagation
+        # ------------------------------------------------------------
         if self.config.use_vectorized_retrieval:
             logger.warning(
                 "Class-aware entity propagation currently only supports BFS version. "
-                "Vectorized retrieval will use original propagation, but PPR class prior can still be applied."
+                "Vectorized retrieval will use original propagation, but PPR class prior "
+                "and query-aware edge transition can still be applied."
             )
             entity_weights, actived_entities = self.calculate_entity_scores_vectorized(
                 question_embedding,
@@ -297,7 +309,9 @@ class ClassRAG:
                 query_target_classes=query_target_classes,
             )
 
-        # Add class-aware entity prior before PPR reset.
+        # ------------------------------------------------------------
+        # 2. Add class-aware entity prior before PPR reset
+        # ------------------------------------------------------------
         if self.class_schema_enabled and query_target_classes:
             entity_weights = self.add_class_aware_entity_prior(
                 entity_weights=entity_weights,
@@ -305,32 +319,85 @@ class ClassRAG:
                 query_target_classes=query_target_classes,
             )
 
-        passage_weights = self.calculate_passage_scores(question, question_embedding, actived_entities)
+        # ------------------------------------------------------------
+        # 3. Passage initial weights
+        # ------------------------------------------------------------
+        passage_weights = self.calculate_passage_scores(
+            question,
+            question_embedding,
+            actived_entities
+        )
+
         node_weights = entity_weights + passage_weights
-        ppr_sorted_passage_indices, ppr_sorted_passage_scores = self.run_ppr(node_weights)
+
+        # ------------------------------------------------------------
+        # 4. Build query-aware edge weights for PPR
+        # ------------------------------------------------------------
+        edge_weights = None
+        if (
+            self.class_schema_enabled
+            and query_target_classes
+            and getattr(self.config, "use_query_aware_edge_transition", False)
+        ):
+            edge_weights = self.build_query_aware_edge_weights(
+                query_target_classes=query_target_classes,
+                seed_entity_hash_ids=seed_entity_hash_ids,
+                actived_entities=actived_entities,
+            )
+
+        # ------------------------------------------------------------
+        # 5. PPR ranking
+        # ------------------------------------------------------------
+        ppr_sorted_passage_indices, ppr_sorted_passage_scores = self.run_ppr(
+            node_weights,
+            edge_weights=edge_weights,
+        )
 
         return ppr_sorted_passage_indices, ppr_sorted_passage_scores
 
-    def run_ppr(self, node_weights):        
-        reset_prob = np.where(np.isnan(node_weights) | (node_weights < 0), 0, node_weights)
+    def run_ppr(self, node_weights, edge_weights=None):
+        """
+        Run Personalized PageRank.
+
+        Parameters
+        ----------
+        node_weights:
+            Query-specific reset distribution over graph nodes.
+
+        edge_weights:
+            Optional query-aware edge weights.
+            If None, use the original static graph edge weights.
+        """
+        reset_prob = np.where(
+            np.isnan(node_weights) | (node_weights < 0),
+            0,
+            node_weights
+        )
+
+        if edge_weights is None:
+            edge_weights = self.graph.es["weight"]
+
         pagerank_scores = self.graph.personalized_pagerank(
             vertices=range(len(self.node_name_to_vertex_idx)),
             damping=self.config.damping,
             directed=False,
-            weights='weight',
+            weights=edge_weights,
             reset=reset_prob,
-            implementation='prpack'
+            implementation="prpack"
         )
-        
-        doc_scores = np.array([pagerank_scores[idx] for idx in self.passage_node_indices])
+
+        doc_scores = np.array([
+            pagerank_scores[idx] for idx in self.passage_node_indices
+        ])
+
         sorted_indices_in_doc_scores = np.argsort(doc_scores)[::-1]
         sorted_passage_scores = doc_scores[sorted_indices_in_doc_scores]
-        
+
         sorted_passage_hash_ids = [
-            self.vertex_idx_to_node_name[self.passage_node_indices[i]] 
+            self.vertex_idx_to_node_name[self.passage_node_indices[i]]
             for i in sorted_indices_in_doc_scores
         ]
-        
+
         return sorted_passage_hash_ids, sorted_passage_scores.tolist()
 
     def get_entity_class_compatibility(self, entity_hash_id, query_target_classes):
@@ -386,6 +453,161 @@ class ClassRAG:
             entity_weights[node_idx] += prior
 
         return entity_weights
+
+    def build_query_aware_edge_weights(
+        self,
+        query_target_classes,
+        seed_entity_hash_ids,
+        actived_entities,
+    ):
+        """
+        Build query-conditioned class-aware edge weights for PPR.
+
+        This function does NOT modify self.graph.es["weight"].
+        It returns a temporary edge-weight list for the current query.
+
+        Main idea:
+        1. If a passage-entity edge connects to an entity whose class is compatible
+        with the query target class, increase this edge weight.
+        2. If the passage also connects to a seed entity, treat it as a bridge passage
+        and give extra boost.
+        3. If the compatible entity is activated by BFS propagation, give extra boost.
+        4. If the compatible entity is within two-hop propagation distance, give more boost.
+        """
+        original_weights = np.array(self.graph.es["weight"], dtype=float)
+        new_weights = original_weights.copy()
+
+        if not self.class_schema_enabled:
+            return new_weights.tolist()
+
+        if self.schema_manager is None:
+            return new_weights.tolist()
+
+        if not query_target_classes:
+            return new_weights.tolist()
+
+        # Hyperparameters
+        beta_entity = getattr(self.config, "edge_class_beta", 0.8)
+        beta_seed_bridge = getattr(self.config, "edge_seed_bridge_beta", 0.6)
+        beta_active = getattr(self.config, "edge_active_beta", 0.4)
+        beta_two_hop = getattr(self.config, "edge_two_hop_beta", 0.4)
+        min_compat = getattr(self.config, "edge_min_compat", 0.01)
+        max_boost = getattr(self.config, "edge_max_boost", 2.5)
+
+        seed_entity_hash_ids = set(seed_entity_hash_ids or [])
+
+        # Activated entity -> propagation tier
+        active_entity_tier = {}
+        for entity_hash_id, (_, _, tier) in actived_entities.items():
+            try:
+                tier = int(tier)
+            except Exception:
+                tier = 1
+            active_entity_tier[entity_hash_id] = max(1, tier)
+
+        # Node type sets
+        entity_hash_id_set = set(self.entity_embedding_store.hash_id_to_text.keys())
+        passage_hash_id_set = set(self.passage_embedding_store.hash_id_to_text.keys())
+
+        def is_entity(node_name):
+            return node_name in entity_hash_id_set
+
+        def is_passage(node_name):
+            return node_name in passage_hash_id_set
+
+        # ------------------------------------------------------------
+        # Precompute bridge passages:
+        # A bridge passage is directly connected to at least one seed entity.
+        # If this same passage also connects to a target-class entity,
+        # it is likely to be useful evidence.
+        # ------------------------------------------------------------
+        seed_bridge_passage_nodes = set()
+
+        for seed_entity_hash_id in seed_entity_hash_ids:
+            seed_node_idx = self.node_name_to_vertex_idx.get(seed_entity_hash_id, None)
+            if seed_node_idx is None:
+                continue
+
+            for nb_idx in self.graph.neighbors(seed_node_idx):
+                nb_name = self.vertex_idx_to_node_name.get(nb_idx, None)
+                if nb_name is not None and is_passage(nb_name):
+                    seed_bridge_passage_nodes.add(nb_idx)
+
+        # ------------------------------------------------------------
+        # Reweight passage-entity edges
+        # ------------------------------------------------------------
+        boosted_edges = 0
+
+        for edge_id, edge in enumerate(self.graph.es):
+            src_idx = edge.source
+            tgt_idx = edge.target
+
+            src_name = self.vertex_idx_to_node_name.get(src_idx, None)
+            tgt_name = self.vertex_idx_to_node_name.get(tgt_idx, None)
+
+            if src_name is None or tgt_name is None:
+                continue
+
+            src_is_entity = is_entity(src_name)
+            tgt_is_entity = is_entity(tgt_name)
+            src_is_passage = is_passage(src_name)
+            tgt_is_passage = is_passage(tgt_name)
+
+            # Only reweight passage-entity edges.
+            # Passage-passage edges remain unchanged.
+            if src_is_entity and tgt_is_passage:
+                entity_hash_id = src_name
+                passage_node_idx = tgt_idx
+            elif tgt_is_entity and src_is_passage:
+                entity_hash_id = tgt_name
+                passage_node_idx = src_idx
+            else:
+                continue
+
+            compat = self.get_entity_class_compatibility(
+                entity_hash_id,
+                query_target_classes
+            )
+
+            if compat < min_compat:
+                continue
+
+            boost = 0.0
+
+            # 1. General class-compatible edge boost
+            boost += beta_entity * compat
+
+            # 2. Bridge passage boost:
+            # The passage is connected to a seed entity and a compatible entity.
+            if passage_node_idx in seed_bridge_passage_nodes:
+                boost += beta_seed_bridge * compat
+
+            # 3. Activated entity boost:
+            # The compatible entity is reached by BFS propagation.
+            if entity_hash_id in active_entity_tier:
+                tier = active_entity_tier[entity_hash_id]
+                boost += beta_active * compat / tier
+
+                # 4. Two-hop boost:
+                # The target-compatible entity is near the seed entity.
+                if tier <= 2:
+                    boost += beta_two_hop * compat
+
+            # Avoid over-amplifying a single edge.
+            boost = min(boost, max_boost)
+
+            if boost <= 0:
+                continue
+
+            new_weights[edge_id] = original_weights[edge_id] * (1.0 + boost)
+            boosted_edges += 1
+
+        logger.debug(
+            f"Query-aware edge transition: boosted_edges={boosted_edges}, "
+            f"total_edges={len(self.graph.es)}"
+        )
+
+        return new_weights.tolist() 
 
     def calculate_entity_scores(
         self,
